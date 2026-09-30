@@ -20,6 +20,66 @@ lazy_static! {
 fn parse_instance_id(instance_id: &str) -> Result<Uuid, String> {
     Uuid::parse_str(instance_id).map_err(|e| format!("invalid instance_id: {}", e))
 }
+/// wintun 虚拟网卡默认走「自动跃点」：wintun 驱动静态上报 100Gbps 链路速率，
+/// Windows 自动跃点表对 >=100Gbps 接口给出跃点 5。这里显式压到 1（合法最小值；
+/// 注意 metric=0 会被 netsh 解释为「恢复自动跃点」，等于没改）。
+/// 网卡由 easytier 异步创建，run_network_instance 返回时可能尚未出现，
+/// 需轮询等待；设置失败只记日志，不影响启动流程。
+#[cfg(target_os = "windows")]
+fn spawn_set_nic_metric_task(instance_id: &str, dev_name: &str) {
+    if dev_name.is_empty() {
+        return;
+    }
+    let instance_id = instance_id.to_string();
+    let dev_name = dev_name.to_string();
+    RT.spawn(async move {
+        let max_attempts = 30u32;
+        for attempt in 1..=max_attempts {
+            let name = dev_name.clone();
+            let ok = tokio::task::spawn_blocking(move || set_interface_metric_blocking(&name))
+                .await
+                .unwrap_or(false);
+
+            if ok {
+                emit_core_log(
+                    &instance_id,
+                    &format!("nic {} interface metric set to 1", dev_name),
+                );
+                return;
+            }
+            if attempt < max_attempts {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+        emit_core_log(
+            &instance_id,
+            &format!("nic {} interface metric set to 1 failed: interface not found", dev_name),
+        );
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn set_interface_metric_blocking(dev_name: &str) -> bool {
+    use std::process::Command;
+    let set_metric = |proto: &str| -> bool {
+        Command::new("netsh.exe")
+            .args([
+                "interface",
+                proto,
+                "set",
+                "interface",
+                &format!("name=\"{}\"", dev_name),
+                "metric=1",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    let v4 = set_metric("ipv4");
+    let _v6 = set_metric("ipv6");
+    // IPv6 尽力而为；IPv4 成功即视为网卡已出现且跃点已生效。
+    v4
+}
 
 async fn get_instance_info(
     instance_id: &str,
@@ -334,9 +394,16 @@ pub async fn create_instance(config_toml: String, watch_event: bool) -> Result<S
         );
         emit_core_log(&instance_id_str, &config_msg);
 
+        let dev_name = cfg.get_flags().dev_name;
         MANAGER
             .run_network_instance(cfg, false, ConfigFileControl::STATIC_CONFIG)
             .map_err(|e| format!("start instance failed: {}", e))?;
+
+        // 等虚拟网卡出现后把接口跃点压到 1（wintun 自动跃点为 5）；失败不影响启动。
+        #[cfg(target_os = "windows")]
+        spawn_set_nic_metric_task(&instance_id_str, &dev_name);
+        #[cfg(not(target_os = "windows"))]
+        let _ = dev_name;
 
         // 事件订阅尽早挂上，启动失败（如 Wintun / 静态 ipv4）仍能进 GUI。
         // 不在此强制等 astral_app_rpc：客户端启动路径不依赖它；需要 RPC 的调用方自行重试。
