@@ -60,15 +60,22 @@ fn spawn_set_nic_metric_task(instance_id: &str, dev_name: &str) {
 
 #[cfg(target_os = "windows")]
 fn set_interface_metric_blocking(dev_name: &str) -> bool {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
+    // CREATE_NO_WINDOW：GUI 进程派生控制台程序（netsh）默认会弹黑窗，必须显式抑制。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let set_metric = |proto: &str| -> bool {
         Command::new("netsh.exe")
+            .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "interface",
                 proto,
                 "set",
                 "interface",
-                &format!("name=\"{}\"", dev_name),
+                // 这里的标签必须是 interface=（不是 name=）；
+                // name= 会被 netsh 拒绝（"'name' 不是这个指令的有效参数"），
+                // 导致跃点设置静默失败、一直停留在 wintun 自动跃点 5。
+                &format!("interface=\"{}\"", dev_name),
                 "metric=1",
             ])
             .output()
