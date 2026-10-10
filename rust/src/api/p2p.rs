@@ -1,8 +1,8 @@
 use easytier::common::config::{
-    process_secure_mode_cfg, ConfigFileControl, ConfigLoader, TomlConfigLoader,
+    ConfigFileControl, ConfigLoader, TomlConfigLoader, normalize_secure_mode_config,
 };
 pub use easytier::common::global_ctx::{EventBusSubscriber, GlobalCtxEvent};
-pub use easytier::instance_manager::NetworkInstanceManager;
+use easytier::instance::factory::{NativeInstanceManager, native_cli_instance_manager};
 pub use easytier::proto;
 pub use easytier::proto::api::instance::{PeerRoutePair, Route};
 pub use easytier::proto::common::NatType;
@@ -14,7 +14,7 @@ const LOCAL_SYNTHETIC_PEER_ID: u32 = 0;
 
 lazy_static! {
     static ref RT: Runtime = Runtime::new().expect("failed to create tokio runtime");
-    static ref MANAGER: NetworkInstanceManager = NetworkInstanceManager::new();
+    static ref MANAGER: NativeInstanceManager = native_cli_instance_manager();
 }
 
 fn parse_instance_id(instance_id: &str) -> Result<Uuid, String> {
@@ -90,10 +90,10 @@ fn set_interface_metric_blocking(dev_name: &str) -> bool {
 
 async fn get_instance_info(
     instance_id: &str,
-) -> Result<easytier::launcher::NetworkInstanceRunningInfo, String> {
+) -> Result<easytier::proto::api::manage::NetworkInstanceRunningInfo, String> {
     let id = parse_instance_id(instance_id)?;
     MANAGER
-        .get_network_info(&id)
+        .network_info(id)
         .await
         .ok_or_else(|| "instance not found".to_string())
 }
@@ -277,11 +277,7 @@ pub async fn is_easytier_running(instance_id: String) -> bool {
     let Ok(id) = parse_instance_id(&instance_id) else {
         return false;
     };
-    MANAGER
-        .iter()
-        .find(|item| *item.key() == id)
-        .map(|item| item.value().is_easytier_running())
-        .unwrap_or(false)
+    MANAGER.instance(id).is_some_and(|instance| instance.is_ready())
 }
 
 #[derive(Debug)]
@@ -335,7 +331,7 @@ pub struct KVNetworkStatus {
 pub async fn set_tun_fd(instance_id: String, fd: i32) -> Result<(), String> {
     let id = parse_instance_id(&instance_id)?;
     MANAGER
-        .set_tun_fd(&id, fd)
+        .attach_tun_fd(id, fd)
         .map_err(|e| format!("set_tun_fd failed: {}", e))
 }
 
@@ -353,7 +349,7 @@ pub async fn create_instance(config_toml: String, watch_event: bool) -> Result<S
         if let Some(sm) = cfg.get_secure_mode() {
             if sm.enabled {
                 let had_priv = sm.local_private_key.is_some();
-                let processed = process_secure_mode_cfg(sm)
+                let processed = normalize_secure_mode_config(sm)
                     .map_err(|e| format!("invalid secure_mode: {}", e))?;
                 cfg.set_secure_mode(Some(processed));
                 if !had_priv {
@@ -403,7 +399,7 @@ pub async fn create_instance(config_toml: String, watch_event: bool) -> Result<S
 
         let dev_name = cfg.get_flags().dev_name;
         MANAGER
-            .run_network_instance(cfg, false, ConfigFileControl::STATIC_CONFIG)
+            .run_network_instance(cfg, ConfigFileControl::STATIC_CONFIG)
             .map_err(|e| format!("start instance failed: {}", e))?;
 
         // 等虚拟网卡出现后把接口跃点压到 1（wintun 自动跃点为 5）；失败不影响启动。
@@ -415,8 +411,10 @@ pub async fn create_instance(config_toml: String, watch_event: bool) -> Result<S
         // 事件订阅尽早挂上，启动失败（如 Wintun / 静态 ipv4）仍能进 GUI。
         // 不在此强制等 astral_app_rpc：客户端启动路径不依赖它；需要 RPC 的调用方自行重试。
         if watch_event {
-            if let Some(instance) = MANAGER.iter().find(|item| *item.key() == instance_id) {
-                if let Some(subscriber) = instance.subscribe_event() {
+            if let Some(instance) = MANAGER.instance(instance_id) {
+                if let Some(subscriber) =
+                    easytier::instance::factory::subscribe_native_instance_event(&instance)
+                {
                     spawn_instance_event_forwarder(subscriber, instance_id_str.clone());
                 }
             }
@@ -428,18 +426,24 @@ pub async fn create_instance(config_toml: String, watch_event: bool) -> Result<S
     .map_err(|e| format!("join handle error: {}", e))?
 }
 
-pub fn close_instance(instance_id: String) -> Result<(), String> {
-    let id = parse_instance_id(&instance_id)?;
-    MANAGER
-        .delete_network_instance(vec![id])
-        .map_err(|e| format!("delete instance failed: {}", e))?;
-    Ok(())
+pub async fn close_instance(instance_id: String) -> Result<(), String> {
+    // delete_network_instances 需要在 tokio runtime 上下文中执行；统一搬到共享 RT。
+    RT.spawn(async move {
+        let id = parse_instance_id(&instance_id)?;
+        MANAGER
+            .delete_network_instances(vec![id])
+            .await
+            .map_err(|e| format!("delete instance failed: {}", e))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("join handle error: {}", e))?
 }
 
 /// Build peer/route pairs from a running-info snapshot (shared by FRB + astral-core).
 #[flutter_rust_bridge::frb(ignore)]
 pub fn peer_route_pairs_from_info(
-    info: easytier::launcher::NetworkInstanceRunningInfo,
+    info: easytier::proto::api::manage::NetworkInstanceRunningInfo,
 ) -> Vec<PeerRoutePair> {
     let mut pairs = if info.peer_route_pairs.is_empty() {
         use easytier::proto::api::instance::list_peer_route_pair;
@@ -517,7 +521,7 @@ pub async fn get_network_status(instance_id: String) -> KVNetworkStatus {
 /// Map running info → KVNetworkStatus (used by FRB and astral-core JSON control).
 #[flutter_rust_bridge::frb(ignore)]
 pub fn network_status_from_info(
-    info: easytier::launcher::NetworkInstanceRunningInfo,
+    info: easytier::proto::api::manage::NetworkInstanceRunningInfo,
 ) -> KVNetworkStatus {
     let pairs = peer_route_pairs_from_info(info);
 
@@ -536,7 +540,7 @@ pub fn network_status_from_info(
         let lat_ms = if route.cost == 1 {
             p.get_latency_ms().unwrap_or(0.0)
         } else {
-            route.path_latency_latency_first() as f64
+            route.path_latency_latency_first.unwrap_or(0) as f64
         };
 
         let loss_percent = p.get_loss_rate().unwrap_or(0.0) * 100.0;
@@ -934,15 +938,17 @@ fn tracing_log_lagged(instance_id: &str, skipped: u64) {
 }
 
 // ============================================================================
-// Credential management (EasyTier CredentialManageRpc)
+// Credential management
+//
+// v2.7 凭据操作已是 `CoreInstance` 的原生方法（内部走本地
+// CredentialManager，并检查调用方持有 network_secret），不再需要旧版
+// `InstanceRpcService` / `CredentialManageRpc` 套壳。
 // ============================================================================
 
-use easytier::proto::api::instance::{
-    GenerateCredentialRequest, ListCredentialsRequest, RevokeCredentialRequest,
-};
-use easytier::proto::api::instance::CredentialManageRpc as _;
-use easytier::proto::rpc_types::controller::BaseController;
-use easytier::rpc_service::InstanceRpcService;
+use std::time::Duration;
+
+use easytier::instance::factory::NativeCoreInstance;
+use easytier::peers::credential_manager::CredentialCreateOptions;
 
 /// 房主生成的进网凭据（客人用 `credential_secret` 作为 secure_mode.local_private_key）。
 #[derive(Debug, Clone)]
@@ -976,19 +982,19 @@ fn pubkey_b64_from_credential_secret(secret_b64: &str) -> Result<String, String>
     Ok(base64::engine::general_purpose::STANDARD.encode(public.as_bytes()))
 }
 
-async fn lookup_instance_rpc(
+async fn lookup_native_instance(
     instance_id: &str,
-    timeout: std::time::Duration,
-) -> Result<std::sync::Arc<dyn InstanceRpcService>, String> {
+    timeout: Duration,
+) -> Result<std::sync::Arc<NativeCoreInstance>, String> {
     let id = parse_instance_id(instance_id)?;
-    let step = std::time::Duration::from_millis(50);
+    let step = Duration::from_millis(50);
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Some(svc) = MANAGER.get_instance_service(&id) {
-            return Ok(svc);
+        if let Some(instance) = MANAGER.instance(id) {
+            return Ok(instance);
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("instance rpc service not ready: {}", instance_id));
+            return Err(format!("instance not ready: {}", instance_id));
         }
         tokio::time::sleep(step).await;
     }
@@ -1005,62 +1011,39 @@ pub async fn generate_credential(
     if ttl_seconds <= 0 {
         return Err("ttl_seconds must be positive".to_string());
     }
-    let svc = lookup_instance_rpc(&instance_id, std::time::Duration::from_secs(5)).await?;
-    let resp = svc
-        .get_credential_manage_service()
-        .generate_credential(
-            BaseController::default(),
-            GenerateCredentialRequest {
-                groups: vec![],
-                // 客人经公共服务器进房时需要参与中继路由；false 时易出现连上中继马上断开、无 DHCP。
-                allow_relay: true,
-                allowed_proxy_cidrs: vec![],
-                ttl_seconds,
-                credential_id: None,
-                instance: None,
-                reusable: Some(reusable),
-            },
-        )
-        .await
+    let instance = lookup_native_instance(&instance_id, Duration::from_secs(5)).await?;
+    let resp = instance
+        .generate_credential(CredentialCreateOptions {
+            groups: vec![],
+            // 客人经公共服务器进房时需要参与中继路由；false 时易出现连上中继马上断开、无 DHCP。
+            allow_relay: true,
+            allowed_proxy_cidrs: vec![],
+            ttl: Duration::from_secs(ttl_seconds as u64),
+            credential_id: None,
+            reusable,
+        })
         .map_err(|e| e.to_string())?;
-    let pubkey_b64 = pubkey_b64_from_credential_secret(&resp.credential_secret)?;
+    let pubkey_b64 = pubkey_b64_from_credential_secret(&resp.secret)?;
     Ok(GeneratedCredentialC {
         credential_id: resp.credential_id,
-        credential_secret: resp.credential_secret,
+        credential_secret: resp.secret,
         pubkey_b64,
     })
 }
 
 /// 撤销凭据；成功后对端将被踢出（不再受信任）。
 pub async fn revoke_credential(instance_id: String, credential_id: String) -> Result<bool, String> {
-    let svc = lookup_instance_rpc(&instance_id, std::time::Duration::from_secs(5)).await?;
-    let resp = svc
-        .get_credential_manage_service()
-        .revoke_credential(
-            BaseController::default(),
-            RevokeCredentialRequest {
-                credential_id,
-                instance: None,
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(resp.success)
+    let instance = lookup_native_instance(&instance_id, Duration::from_secs(5)).await?;
+    instance
+        .revoke_credential(&credential_id)
+        .map_err(|e| e.to_string())
 }
 
 /// 列出当前实例上仍有效的凭据。
 pub async fn list_credentials(instance_id: String) -> Result<Vec<CredentialInfoC>, String> {
-    let svc = lookup_instance_rpc(&instance_id, std::time::Duration::from_secs(5)).await?;
-    let resp = svc
-        .get_credential_manage_service()
-        .list_credentials(
-            BaseController::default(),
-            ListCredentialsRequest { instance: None },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(resp
-        .credentials
+    let instance = lookup_native_instance(&instance_id, Duration::from_secs(5)).await?;
+    Ok(instance
+        .credential_snapshots()
         .into_iter()
         .map(|c| CredentialInfoC {
             credential_id: c.credential_id,
